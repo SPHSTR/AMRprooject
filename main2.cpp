@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <TaskScheduler.h>
 #include <AS5600.h>
+#include <MS5611.h>
 
 // --- Micro-ROS Includes ---
 #include <micro_ros_arduino.h>
@@ -11,6 +12,7 @@
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
+#include <rmw_microros/rmw_microros.h>
 
 // Message Type 
 #include <std_msgs/msg/float32_multi_array.h>
@@ -28,6 +30,7 @@ struct RobotState {
   float platform_euler[3];
   float arm_angle[2];     
   float wheel_velocity[2];
+  float atmospheric[2];
 };
 
 RobotState robotData;
@@ -35,6 +38,8 @@ RobotState robotData;
 // --- Global Objects (Sensors) ---
 MPU6050 body_gyro(Wire), platform_gyro(Wire);
 AS5600 arm_encoderL, arm_encoderR, wheel_encoderL, wheel_encoderR;
+MS5611 baro_sensor;
+
 const float alpha = 0.2; 
 Scheduler runner;
 
@@ -44,12 +49,14 @@ rcl_publisher_t body_pub;
 rcl_publisher_t plat_pub;
 rcl_publisher_t arm_pub;
 rcl_publisher_t wheel_pub;
+rcl_publisher_t atm_pub;
 
 // Message 
 geometry_msgs__msg__Vector3 body_msg;
 geometry_msgs__msg__Vector3 plat_msg;
 std_msgs__msg__Float32MultiArray arm_msg;
 std_msgs__msg__Float32MultiArray wheel_msg;
+std_msgs__msg__Float32MultiArray atm_msg;
 
 rclc_executor_t executor;
 rclc_support_t support;
@@ -107,6 +114,17 @@ void WheelVelocityReadCallback() {
   }
 }
 
+void AtmosphericReadCallback() {
+  if(tcaSelect(6)) {
+    int result = baro_sensor.read(); 
+    
+    if (result == MS5611_READ_OK) {
+      robotData.atmospheric[0] = baro_sensor.getTemperature(); // Celsius
+      robotData.atmospheric[1] = baro_sensor.getPressure();    // mBar
+    }
+  }
+}
+
 // --- Micro-ROS Functions (Core 0) ---
 
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
@@ -136,6 +154,12 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
     wheel_msg.data.data[1] = robotData.wheel_velocity[1];
     wheel_msg.data.size = 2;
     RCSOFTCHECK(rcl_publish(&wheel_pub, &wheel_msg, NULL));
+
+    // 5. Publish Barometer (Temp, Pressure)
+    atm_msg.data.data[0] = robotData.atmospheric[0];
+    atm_msg.data.data[1] = robotData.atmospheric[1];
+    atm_msg.data.size = 2;
+    RCSOFTCHECK(rcl_publish(&atm_pub, &atm_msg, NULL));
   }
 }
 
@@ -177,7 +201,14 @@ void microRosTask(void * parameter) {
     &wheel_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
     "sensors/wheel_vel"));
 
+  // Pub 5: Barometer
+  RCCHECK(rclc_publisher_init_default(
+    &atm_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+    "sensors/barometer"));
+
+
   // --- Allocate Memory for Arrays ---
+  // Arm Msg
   arm_msg.data.capacity = 2;
   arm_msg.data.data = (float*) malloc(arm_msg.data.capacity * sizeof(float));
   arm_msg.data.size = 0;
@@ -186,6 +217,7 @@ void microRosTask(void * parameter) {
   arm_msg.layout.dim.data = NULL;
   arm_msg.layout.data_offset = 0;
 
+  // Wheel Msg
   wheel_msg.data.capacity = 2;
   wheel_msg.data.data = (float*) malloc(wheel_msg.data.capacity * sizeof(float));
   wheel_msg.data.size = 0;
@@ -193,6 +225,15 @@ void microRosTask(void * parameter) {
   wheel_msg.layout.dim.size = 0;
   wheel_msg.layout.dim.data = NULL;
   wheel_msg.layout.data_offset = 0;
+
+  // Atmospheric Msg
+  atm_msg.data.capacity = 2;
+  atm_msg.data.data = (float*) malloc(atm_msg.data.capacity * sizeof(float));
+  atm_msg.data.size = 0;
+  atm_msg.layout.dim.capacity = 0;
+  atm_msg.layout.dim.size = 0;
+  atm_msg.layout.dim.data = NULL;
+  atm_msg.layout.data_offset = 0;
   
   // Init Timer
   RCCHECK(rclc_timer_init_default2(&timer, &support, RCL_MS_TO_NS(100), timer_callback, true));
@@ -212,32 +253,37 @@ Task tBodyGyroRead(20, TASK_FOREVER, &bodyGyroReadCallback);
 Task tPlatformGyroRead(20, TASK_FOREVER, &platformGyroReadCallback);
 Task tArmEncoderRead(50, TASK_FOREVER, &ArmEncoderReadCallback);
 Task tWheelVelocityRead(20, TASK_FOREVER, &WheelVelocityReadCallback);
+Task tAtmosphericRead(100, TASK_FOREVER, &AtmosphericReadCallback);
 
 void setup() {
   Wire.begin();
   Wire.setClock(100000); 
   Wire.setTimeOut(I2C_TIMEOUT_MS); 
 
-  if(tcaSelect(0)) { delay(10); body_gyro.begin(); body_gyro.calcOffsets(true, true); }
+  // if(tcaSelect(0)) { delay(10); body_gyro.begin(); body_gyro.calcOffsets(true, true); }
 
   // if(tcaSelect(1)) { delay(10); platform_gyro.begin(); platform_gyro.calcOffsets(true, true);}
 
-  // if(tcaSelect(2)) arm_encoderL.begin();
-  // if(tcaSelect(3)) arm_encoderR.begin();
+  // if(tcaSelect(2)) { delay(10); arm_encoderL.begin();}
+  // if(tcaSelect(3)) { delay(10); arm_encoderR.begin();}
 
-  // if(tcaSelect(4)) wheel_encoderL.begin();
-  // if(tcaSelect(5)) wheel_encoderR.begin();
+  // if(tcaSelect(4)) { delay(10); wheel_encoderL.begin();}
+  // if(tcaSelect(5)) { delay(10); wheel_encoderR.begin();}
+
+  if(tcaSelect(6)) { delay(10); baro_sensor.begin();}
   
   runner.init();
   runner.addTask(tBodyGyroRead); 
   runner.addTask(tPlatformGyroRead); 
   runner.addTask(tArmEncoderRead); 
   runner.addTask(tWheelVelocityRead);
+  runner.addTask(tAtmosphericRead);
   
-  tBodyGyroRead.enable(); 
+  // tBodyGyroRead.enable(); 
   // tPlatformGyroRead.enable(); 
   // tArmEncoderRead.enable(); 
   // tWheelVelocityRead.enable();
+  tAtmosphericRead.enable();
 
   xTaskCreatePinnedToCore(microRosTask, "microRosTask", 10000, NULL, 1, &rosTaskHandle, 0);         
 }
@@ -245,3 +291,11 @@ void setup() {
 void loop() {
   runner.execute();
 }
+
+
+
+/** TODO 
+ *  arm init angle
+ *  platform gyro limit reset
+ * 
+*/
